@@ -4,8 +4,21 @@
 #include <deep_gemm/scheduler/mqa_logits.hpp>
 #include <deep_gemm/scheduler/paged_mqa_logits.hpp>
 
+// kernel_operator.h is unavailable under bisheng --cce-aicore-only, so the
+// upstream ascendc_assert is stubbed (same guard as QuantLightningIndexer.hpp).
+#ifndef ascendc_assert
+#define ascendc_assert(cond, ...) ((void)0)
+#endif
+
 namespace deep_gemm {
 using namespace __cce_simd;
+
+// Optional per-Q-block completion hook for mqa_logits_core_impl. The default
+// instance is a no-op, so the standalone mqa_logits kernel is unaffected.
+struct NullBlockHook {
+    __aicore__ void operator()(uint32_t, uint32_t, uint32_t) const {
+    }
+};
 
 // Pack adjacent scale pairs into the 16-token fragments consumed by L0B_MX.
 __simd_vf__ inline void vf_mqa_logits_pack_scales(__ubuf__ int16_t* scales, uint32_t num_elems) {
@@ -190,7 +203,8 @@ template <
     uint32_t kNumLogitsStages,
     uint32_t kPageSize,
     bool kUseAscendKVLayout,
-    typename MakeScheduler
+    typename MakeScheduler,
+    typename OnBlockDone = NullBlockHook
 >
 __aicore__ inline void mqa_logits_core_impl(
     gm_ptr<uint8_t, Major::K> q,
@@ -199,7 +213,8 @@ __aicore__ inline void mqa_logits_core_impl(
     __gm__ int16_t* sf_kv,
     gm_ptr<bfloat16_t, Major::K> weights,
     gm_ptr<bfloat16_t, Major::K> logits,
-    const MakeScheduler& make_scheduler
+    const MakeScheduler& make_scheduler,
+    OnBlockDone on_block_done = OnBlockDone{}
 ) {
     using Scheduler = decltype(make_scheduler(block_idx));
     constexpr bool kIsPaged = kPageSize != 0;
@@ -608,6 +623,10 @@ __aicore__ inline void mqa_logits_core_impl(
             }
             asc_sync_notify(PIPE_V, PIPE_MTE2, static_cast<event_t>(weight_stage_idx));
             weight_stage_idx = (weight_stage_idx + 1) % kNumWeightStages;
+
+            // Per-Q-block tail hook (V3): lets the fused kernel run this block's
+            // topk while the AIC proceeds with the next Q-block's MMAD.
+            on_block_done(q_block_idx, q_base, num_q_tokens_in_block);
         }
     }
 }

@@ -71,6 +71,9 @@ from ._C import (
     fp8_einsum,
     # Attention kernels
     fp8_fp4_mqa_logits,
+    fp8_fp4_mqa_logits_topk,
+    fp8_fp4_mqa_logits_topk_v2,
+    fp8_fp4_mqa_logits_topk_v3,
     get_paged_mqa_logits_metadata,
     fp8_fp4_paged_mqa_logits,
     get_sparse_mqa_logits_metadata,

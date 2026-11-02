@@ -268,7 +268,7 @@ static torch::Tensor fp8_fp4_mqa_logits(
         .num_cd_stages = 2u,
         .num_q_stages = 2u,
         .num_kv_stages = 4u,
-        .num_accum_stages = 2u,
+        .num_accum_stages = 1u,
         .num_logits_stages = 3u,
         .launch_options = {.num_blocks = runtime->get_num_sms()},
     };
@@ -306,6 +306,297 @@ static torch::Tensor fp8_fp4_mqa_logits(
                                  weights.data_ptr(), logits.data_ptr(), cu_seq_len_k_start.data_ptr(),
                                  cu_seq_len_k_end.data_ptr());
     return logits;
+}
+
+// Fused mqa_logits + topk: runs both stages in a single kernel launch.
+// Returns (output_values, output_indices) of shape [num_q_tokens, topk].
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_fp4_mqa_logits_topk(
+    const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
+    const std::pair<torch::Tensor, torch::Tensor>& kv,
+    const torch::Tensor& weights,
+    const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end,
+    uint32_t max_seqlen_k,
+    uint32_t topk,
+    bool return_values = true,
+    bool abort_when_nan_found = false,
+    bool sorted_index = false
+) {
+    const auto& q_data = q.first;
+    const auto& sf_q = q.second;
+    const auto& kv_data = kv.first;
+    const auto& sf_kv = kv.second;
+
+    DJ_HOST_ASSERT(q_data.dim() == 3);
+    DJ_HOST_ASSERT(kv_data.dim() == 2);
+    DJ_HOST_ASSERT(weights.dim() == 2);
+    DJ_HOST_ASSERT(cu_seq_len_k_start.is_contiguous() and cu_seq_len_k_end.is_contiguous());
+    DJ_HOST_ASSERT(cu_seq_len_k_start.scalar_type() == torch::kInt and cu_seq_len_k_end.scalar_type() == torch::kInt);
+    DJ_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16, "Ascend MQA logits expects bf16 weights");
+    DJ_HOST_ASSERT(topk > 0 and topk <= 4096, "topk must be in (0, 4096]");
+
+    const auto num_q_tokens = static_cast<uint32_t>(q_data.size(0));
+    const auto num_heads = static_cast<uint32_t>(q_data.size(1));
+    const uint32_t head_dim = q_data.scalar_type() == kPackedFP4 ? static_cast<uint32_t>(q_data.size(2)) * 2u : static_cast<uint32_t>(q_data.size(2));
+    const auto num_kv_tokens = static_cast<uint32_t>(kv_data.size(0));
+    const bool is_fp4 = q_data.scalar_type() == kPackedFP4;
+    const uint32_t head_dim_storage = is_fp4 ? head_dim / 2u : head_dim;
+    DJ_HOST_ASSERT(num_heads >= 4 and num_heads <= 64 and num_heads % 4 == 0);
+    DJ_HOST_ASSERT(head_dim == 64 or head_dim == 128,
+                   "Initial Ascend MQA logits kernel supports head_dim=64/128 only");
+    DJ_HOST_ASSERT(max_seqlen_k > 0);
+    const MQALogitsDesc desc = {
+        .is_fp4 = is_fp4,
+        .num_q_tokens = num_q_tokens,
+        .num_kv_tokens = num_kv_tokens,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    };
+    const MQALogitsConfig config = {
+        .split_kv = 512u,
+        .mad_m = 64u / num_heads * num_heads,
+        .num_cd_stages = 2u,
+        .num_q_stages = 2u,
+        .num_kv_stages = 4u,
+        .num_accum_stages = 1u,
+        .num_logits_stages = 3u,
+        .launch_options = {.num_blocks = runtime->get_num_sms()},
+    };
+    DJ_HOST_ASSERT(weights.size(0) == num_q_tokens and weights.size(1) == num_heads and weights.stride(1) == 1);
+    DJ_HOST_ASSERT(cu_seq_len_k_start.numel() == num_q_tokens and cu_seq_len_k_end.numel() == num_q_tokens);
+    DJ_HOST_ASSERT(q_data.is_contiguous() and kv_data.is_contiguous());
+    DJ_HOST_ASSERT(kv_data.size(1) == head_dim_storage);
+
+    DJ_HOST_ASSERT((q_data.scalar_type() == torch::kFloat8_e4m3fn and kv_data.scalar_type() == torch::kFloat8_e4m3fn) or
+                   (q_data.scalar_type() == kPackedFP4 and kv_data.scalar_type() == kPackedFP4));
+    DJ_HOST_ASSERT(sf_q.has_value(), "MQA logits requires Q scale factors");
+
+    auto sf_q_view = sf_q.value();
+    if (sf_q_view.dim() == 3) {
+        DJ_HOST_ASSERT(sf_q_view.size(0) == num_q_tokens and sf_q_view.size(1) == num_heads);
+        sf_q_view = sf_q_view.reshape({static_cast<int64_t>(num_q_tokens) * num_heads, sf_q_view.size(2)});
+    }
+    DJ_HOST_ASSERT(sf_q_view.scalar_type() == torch::kShort and sf_kv.scalar_type() == torch::kShort);
+    DJ_HOST_ASSERT(sf_q_view.dim() == 2 and sf_q_view.size(0) == num_q_tokens * num_heads and
+                   sf_q_view.size(1) == head_dim / 64);
+    DJ_HOST_ASSERT(sf_kv.dim() == 2 and sf_kv.size(0) == num_kv_tokens and sf_kv.size(1) == head_dim / 64);
+    auto sf_q_packed = sf_q_view;
+    auto sf_kv_packed = sf_kv;
+    if (sf_q_packed.stride(0) != 1 or sf_q_packed.stride(1) != static_cast<int64_t>(num_q_tokens) * num_heads)
+        sf_q_packed = sf_q_packed.t().contiguous().t();
+    if (sf_kv_packed.stride(0) != 1 or sf_kv_packed.stride(1) != static_cast<int64_t>(num_kv_tokens))
+        sf_kv_packed = sf_kv_packed.t().contiguous().t();
+
+    const uint32_t logits_stride = get_logits_stride(max_seqlen_k);
+    // Allocate one extra row as scratch for MTE3 drain (dummy store target).
+    auto logits = torch::empty_strided({num_q_tokens + 1, max_seqlen_k}, {logits_stride, 1}, q_data.options().dtype(torch::kBFloat16));
+
+    // Output stride must be 32B-aligned (DeepSelect's OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT).
+    const uint32_t output_values_stride = ceil_div(topk, 16u) * 16u;
+    const uint32_t output_indices_stride = ceil_div(topk, 8u) * 8u;
+    auto output_values = return_values
+        ? torch::empty_strided({num_q_tokens, topk}, {output_values_stride, 1}, q_data.options().dtype(torch::kBFloat16))
+        : torch::empty({0}, q_data.options().dtype(torch::kBFloat16));
+    auto output_indices = torch::empty_strided({num_q_tokens, topk}, {output_indices_stride, 1}, q_data.options().dtype(torch::kInt32));
+
+    deep_gemm::launch_mqa_logits_topk(desc, config,
+                                      static_cast<uint32_t>(weights.stride(0)), logits_stride,
+                                      output_values_stride, output_indices_stride, topk,
+                                      q_data.data_ptr(), kv_data.data_ptr(),
+                                      sf_q_packed.data_ptr(), sf_kv_packed.data_ptr(),
+                                      weights.data_ptr(), logits.data_ptr(),
+                                      return_values ? output_values.data_ptr() : nullptr,
+                                      output_indices.data_ptr(),
+                                      cu_seq_len_k_start.data_ptr(),
+                                      cu_seq_len_k_end.data_ptr(),
+                                      abort_when_nan_found, sorted_index);
+    return {return_values ? output_values : torch::Tensor(), output_indices, logits};
+}
+
+// V2 pipelined fused kernel (方案 B: incremental histogram + topk finalize).
+// Same interface as fp8_fp4_mqa_logits_topk but uses the pipelined kernel.
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_fp4_mqa_logits_topk_v2(
+    const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
+    const std::pair<torch::Tensor, torch::Tensor>& kv,
+    const torch::Tensor& weights,
+    const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end,
+    uint32_t max_seqlen_k,
+    uint32_t topk,
+    bool return_values = true,
+    bool abort_when_nan_found = false,
+    bool sorted_index = false
+) {
+    const auto& q_data = q.first;
+    const auto& sf_q = q.second;
+    const auto& kv_data = kv.first;
+    const auto& sf_kv = kv.second;
+
+    DJ_HOST_ASSERT(q_data.dim() == 3);
+    DJ_HOST_ASSERT(kv_data.dim() == 2);
+    DJ_HOST_ASSERT(weights.dim() == 2);
+    DJ_HOST_ASSERT(cu_seq_len_k_start.is_contiguous() and cu_seq_len_k_end.is_contiguous());
+    DJ_HOST_ASSERT(cu_seq_len_k_start.scalar_type() == torch::kInt and cu_seq_len_k_end.scalar_type() == torch::kInt);
+    DJ_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16, "Ascend MQA logits expects bf16 weights");
+    DJ_HOST_ASSERT(topk > 0 and topk <= 4096, "topk must be in (0, 4096]");
+
+    const auto num_q_tokens = static_cast<uint32_t>(q_data.size(0));
+    const auto num_heads = static_cast<uint32_t>(q_data.size(1));
+    const uint32_t head_dim = q_data.scalar_type() == kPackedFP4 ? static_cast<uint32_t>(q_data.size(2)) * 2u : static_cast<uint32_t>(q_data.size(2));
+    const auto num_kv_tokens = static_cast<uint32_t>(kv_data.size(0));
+    const bool is_fp4 = q_data.scalar_type() == kPackedFP4;
+    const uint32_t head_dim_storage = is_fp4 ? head_dim / 2u : head_dim;
+    DJ_HOST_ASSERT(num_heads >= 4 and num_heads <= 64 and num_heads % 4 == 0);
+    DJ_HOST_ASSERT(head_dim == 64 or head_dim == 128);
+    DJ_HOST_ASSERT(max_seqlen_k > 0);
+    const MQALogitsDesc desc = {
+        .is_fp4 = is_fp4, .num_q_tokens = num_q_tokens,
+        .num_kv_tokens = num_kv_tokens, .num_heads = num_heads, .head_dim = head_dim,
+    };
+    const MQALogitsConfig config = {
+        .split_kv = 512u, .mad_m = 64u / num_heads * num_heads,
+        .num_cd_stages = 2u, .num_q_stages = 2u, .num_kv_stages = 4u,
+        .num_accum_stages = 2u, .num_logits_stages = 3u,
+        .launch_options = {.num_blocks = runtime->get_num_sms()},
+    };
+    DJ_HOST_ASSERT(weights.size(0) == num_q_tokens and weights.size(1) == num_heads and weights.stride(1) == 1);
+    DJ_HOST_ASSERT(cu_seq_len_k_start.numel() == num_q_tokens and cu_seq_len_k_end.numel() == num_q_tokens);
+    DJ_HOST_ASSERT(q_data.is_contiguous() and kv_data.is_contiguous());
+    DJ_HOST_ASSERT(kv_data.size(1) == head_dim_storage);
+    DJ_HOST_ASSERT((q_data.scalar_type() == torch::kFloat8_e4m3fn and kv_data.scalar_type() == torch::kFloat8_e4m3fn) or
+                   (q_data.scalar_type() == kPackedFP4 and kv_data.scalar_type() == kPackedFP4));
+    DJ_HOST_ASSERT(sf_q.has_value(), "MQA logits requires Q scale factors");
+
+    auto sf_q_view = sf_q.value();
+    if (sf_q_view.dim() == 3) {
+        DJ_HOST_ASSERT(sf_q_view.size(0) == num_q_tokens and sf_q_view.size(1) == num_heads);
+        sf_q_view = sf_q_view.reshape({static_cast<int64_t>(num_q_tokens) * num_heads, sf_q_view.size(2)});
+    }
+    DJ_HOST_ASSERT(sf_q_view.scalar_type() == torch::kShort and sf_kv.scalar_type() == torch::kShort);
+    DJ_HOST_ASSERT(sf_q_view.dim() == 2 and sf_q_view.size(0) == num_q_tokens * num_heads and
+                   sf_q_view.size(1) == head_dim / 64);
+    DJ_HOST_ASSERT(sf_kv.dim() == 2 and sf_kv.size(0) == num_kv_tokens and sf_kv.size(1) == head_dim / 64);
+    auto sf_q_packed = sf_q_view;
+    auto sf_kv_packed = sf_kv;
+    if (sf_q_packed.stride(0) != 1 or sf_q_packed.stride(1) != static_cast<int64_t>(num_q_tokens) * num_heads)
+        sf_q_packed = sf_q_packed.t().contiguous().t();
+    if (sf_kv_packed.stride(0) != 1 or sf_kv_packed.stride(1) != static_cast<int64_t>(num_kv_tokens))
+        sf_kv_packed = sf_kv_packed.t().contiguous().t();
+
+    const uint32_t logits_stride = get_logits_stride(max_seqlen_k);
+    auto logits = torch::empty_strided({num_q_tokens + 1, max_seqlen_k}, {logits_stride, 1}, q_data.options().dtype(torch::kBFloat16));
+
+    const uint32_t output_values_stride = ceil_div(topk, 16u) * 16u;
+    const uint32_t output_indices_stride = ceil_div(topk, 8u) * 8u;
+    auto output_values = return_values
+        ? torch::empty_strided({num_q_tokens, topk}, {output_values_stride, 1}, q_data.options().dtype(torch::kBFloat16))
+        : torch::empty({0}, q_data.options().dtype(torch::kBFloat16));
+    auto output_indices = torch::empty_strided({num_q_tokens, topk}, {output_indices_stride, 1}, q_data.options().dtype(torch::kInt32));
+
+    deep_gemm::launch_mqa_logits_topk_v2(desc, config,
+                                      static_cast<uint32_t>(weights.stride(0)), logits_stride,
+                                      output_values_stride, output_indices_stride, topk,
+                                      q_data.data_ptr(), kv_data.data_ptr(),
+                                      sf_q_packed.data_ptr(), sf_kv_packed.data_ptr(),
+                                      weights.data_ptr(), logits.data_ptr(),
+                                      return_values ? output_values.data_ptr() : nullptr,
+                                      output_indices.data_ptr(),
+                                      cu_seq_len_k_start.data_ptr(),
+                                      cu_seq_len_k_end.data_ptr(),
+                                      abort_when_nan_found, sorted_index);
+    return {return_values ? output_values : torch::Tensor(), output_indices, logits};
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fp8_fp4_mqa_logits_topk_v3(
+    const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
+    const std::pair<torch::Tensor, torch::Tensor>& kv,
+    const torch::Tensor& weights,
+    const torch::Tensor& cu_seq_len_k_start,
+    const torch::Tensor& cu_seq_len_k_end,
+    uint32_t max_seqlen_k,
+    uint32_t topk,
+    bool return_values = true,
+    bool abort_when_nan_found = false,
+    bool sorted_index = false
+) {
+    const auto& q_data = q.first;
+    const auto& sf_q = q.second;
+    const auto& kv_data = kv.first;
+    const auto& sf_kv = kv.second;
+
+    DJ_HOST_ASSERT(q_data.dim() == 3);
+    DJ_HOST_ASSERT(kv_data.dim() == 2);
+    DJ_HOST_ASSERT(weights.dim() == 2);
+    DJ_HOST_ASSERT(cu_seq_len_k_start.is_contiguous() and cu_seq_len_k_end.is_contiguous());
+    DJ_HOST_ASSERT(cu_seq_len_k_start.scalar_type() == torch::kInt and cu_seq_len_k_end.scalar_type() == torch::kInt);
+    DJ_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16, "Ascend MQA logits expects bf16 weights");
+    DJ_HOST_ASSERT(topk > 0 and topk <= 4096, "topk must be in (0, 4096]");
+
+    const auto num_q_tokens = static_cast<uint32_t>(q_data.size(0));
+    const auto num_heads = static_cast<uint32_t>(q_data.size(1));
+    const uint32_t head_dim = q_data.scalar_type() == kPackedFP4 ? static_cast<uint32_t>(q_data.size(2)) * 2u : static_cast<uint32_t>(q_data.size(2));
+    const auto num_kv_tokens = static_cast<uint32_t>(kv_data.size(0));
+    const bool is_fp4 = q_data.scalar_type() == kPackedFP4;
+    const uint32_t head_dim_storage = is_fp4 ? head_dim / 2u : head_dim;
+    DJ_HOST_ASSERT(num_heads >= 4 and num_heads <= 64 and num_heads % 4 == 0);
+    DJ_HOST_ASSERT(head_dim == 64 or head_dim == 128);
+    DJ_HOST_ASSERT(max_seqlen_k > 0);
+    const MQALogitsDesc desc = {
+        .is_fp4 = is_fp4, .num_q_tokens = num_q_tokens,
+        .num_kv_tokens = num_kv_tokens, .num_heads = num_heads, .head_dim = head_dim,
+    };
+    const MQALogitsConfig config = {
+        .split_kv = 512u, .mad_m = 64u / num_heads * num_heads,
+        .num_cd_stages = 2u, .num_q_stages = 2u, .num_kv_stages = 4u,
+        .num_accum_stages = 2u, .num_logits_stages = 3u,
+        .launch_options = {.num_blocks = runtime->get_num_sms()},
+    };
+    DJ_HOST_ASSERT(weights.size(0) == num_q_tokens and weights.size(1) == num_heads and weights.stride(1) == 1);
+    DJ_HOST_ASSERT(cu_seq_len_k_start.numel() == num_q_tokens and cu_seq_len_k_end.numel() == num_q_tokens);
+    DJ_HOST_ASSERT(q_data.is_contiguous() and kv_data.is_contiguous());
+    DJ_HOST_ASSERT(kv_data.size(1) == head_dim_storage);
+    DJ_HOST_ASSERT((q_data.scalar_type() == torch::kFloat8_e4m3fn and kv_data.scalar_type() == torch::kFloat8_e4m3fn) or
+                   (q_data.scalar_type() == kPackedFP4 and kv_data.scalar_type() == kPackedFP4));
+    DJ_HOST_ASSERT(sf_q.has_value(), "MQA logits requires Q scale factors");
+
+    auto sf_q_view = sf_q.value();
+    if (sf_q_view.dim() == 3) {
+        DJ_HOST_ASSERT(sf_q_view.size(0) == num_q_tokens and sf_q_view.size(1) == num_heads);
+        sf_q_view = sf_q_view.reshape({static_cast<int64_t>(num_q_tokens) * num_heads, sf_q_view.size(2)});
+    }
+    DJ_HOST_ASSERT(sf_q_view.scalar_type() == torch::kShort and sf_kv.scalar_type() == torch::kShort);
+    DJ_HOST_ASSERT(sf_q_view.dim() == 2 and sf_q_view.size(0) == num_q_tokens * num_heads and
+                   sf_q_view.size(1) == head_dim / 64);
+    DJ_HOST_ASSERT(sf_kv.dim() == 2 and sf_kv.size(0) == num_kv_tokens and sf_kv.size(1) == head_dim / 64);
+    auto sf_q_packed = sf_q_view;
+    auto sf_kv_packed = sf_kv;
+    if (sf_q_packed.stride(0) != 1 or sf_q_packed.stride(1) != static_cast<int64_t>(num_q_tokens) * num_heads)
+        sf_q_packed = sf_q_packed.t().contiguous().t();
+    if (sf_kv_packed.stride(0) != 1 or sf_kv_packed.stride(1) != static_cast<int64_t>(num_kv_tokens))
+        sf_kv_packed = sf_kv_packed.t().contiguous().t();
+
+    const uint32_t logits_stride = get_logits_stride(max_seqlen_k);
+    auto logits = torch::empty_strided({num_q_tokens + 1, max_seqlen_k}, {logits_stride, 1}, q_data.options().dtype(torch::kBFloat16));
+
+    const uint32_t output_values_stride = ceil_div(topk, 16u) * 16u;
+    const uint32_t output_indices_stride = ceil_div(topk, 8u) * 8u;
+    auto output_values = return_values
+        ? torch::empty_strided({num_q_tokens, topk}, {output_values_stride, 1}, q_data.options().dtype(torch::kBFloat16))
+        : torch::empty({0}, q_data.options().dtype(torch::kBFloat16));
+    auto output_indices = torch::empty_strided({num_q_tokens, topk}, {output_indices_stride, 1}, q_data.options().dtype(torch::kInt32));
+
+    deep_gemm::launch_mqa_logits_topk_v3(desc, config,
+                                      static_cast<uint32_t>(weights.stride(0)), logits_stride,
+                                      output_values_stride, output_indices_stride, topk,
+                                      q_data.data_ptr(), kv_data.data_ptr(),
+                                      sf_q_packed.data_ptr(), sf_kv_packed.data_ptr(),
+                                      weights.data_ptr(), logits.data_ptr(),
+                                      return_values ? output_values.data_ptr() : nullptr,
+                                      output_indices.data_ptr(),
+                                      cu_seq_len_k_start.data_ptr(),
+                                      cu_seq_len_k_end.data_ptr(),
+                                      abort_when_nan_found, sorted_index);
+    return {return_values ? output_values : torch::Tensor(), output_indices, logits};
 }
 
 static torch::Tensor get_paged_mqa_logits_metadata(
@@ -441,6 +732,27 @@ and active core count used to prepare it.
           py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("max_seqlen_k"));
+    m.def("fp8_fp4_mqa_logits_topk", fp8_fp4_mqa_logits_topk,
+          py::arg("q"), py::arg("kv"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("max_seqlen_k"), py::arg("topk"),
+          py::arg("return_values") = true,
+          py::arg("abort_when_nan_found") = false,
+          py::arg("sorted_index") = false);
+    m.def("fp8_fp4_mqa_logits_topk_v2", fp8_fp4_mqa_logits_topk_v2,
+          py::arg("q"), py::arg("kv"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("max_seqlen_k"), py::arg("topk"),
+          py::arg("return_values") = true,
+          py::arg("abort_when_nan_found") = false,
+          py::arg("sorted_index") = false);
+    m.def("fp8_fp4_mqa_logits_topk_v3", fp8_fp4_mqa_logits_topk_v3,
+          py::arg("q"), py::arg("kv"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("max_seqlen_k"), py::arg("topk"),
+          py::arg("return_values") = true,
+          py::arg("abort_when_nan_found") = false,
+          py::arg("sorted_index") = false);
     m.def("get_paged_mqa_logits_metadata", get_paged_mqa_logits_metadata,
           py::arg("context_lens"), py::arg("num_heads"), py::arg("indices"));
     m.def("fp8_fp4_paged_mqa_logits", fp8_fp4_paged_mqa_logits,
@@ -451,3 +763,7 @@ and active core count used to prepare it.
 }
 
 } // namespace deep_gemm::attention_api
+
+// ACCUM1_EXPERIMENT
+
+// API_V3

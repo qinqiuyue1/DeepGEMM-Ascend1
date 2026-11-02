@@ -77,6 +77,185 @@ static void __instantiate() {{
                 cu_seq_len_k_start, cu_seq_len_k_end);
 }
 
+static void launch_mqa_logits_topk(
+    const MQALogitsDesc& desc, const MQALogitsConfig& config,
+    const uint32_t& weights_stride, const uint32_t& logits_stride,
+    const uint32_t& output_values_stride, const uint32_t& output_indices_stride,
+    const uint32_t& topk,
+    void* q, void* kv,
+    void* sf_q, void* sf_kv,
+    void* weights, void* logits,
+    void* output_values, void* output_indices,
+    void* cu_seq_len_k_start, void* cu_seq_len_k_end,
+    bool abort_when_nan_found, bool sorted_index
+) {
+    const uint32_t topk_tier = topk <= 512 ? 512u : (topk <= 1024 ? 1024u : 4096u);
+    const auto code = std::format(R"(
+#include <deep_gemm/mqa_logits_topk.hpp>
+
+using namespace deep_gemm;
+static void __instantiate() {{
+    auto p = reinterpret_cast<void*>(&mqa_logits_topk_impl<
+        {},
+        {}, {},
+        {}, {}, {},
+        {}, {}, {},
+        {},
+        {},
+        {},
+        {},
+        {}>);
+}}
+)",
+        desc.is_fp4 ? "true" : "false",
+        desc.num_heads, desc.head_dim,
+        config.split_kv, config.mad_m, config.num_cd_stages,
+        config.num_q_stages, config.num_kv_stages, config.num_accum_stages,
+        config.num_logits_stages,
+        config.launch_options.num_blocks.value(),
+        topk_tier,
+        abort_when_nan_found ? "true" : "false",
+        sorted_index ? "true" : "false");
+    if (runtime->get_dry_run()) {
+        jit->compile_without_load("mqa_logits_topk", code);
+        return;
+    }
+    const auto kernel = jit->compile("mqa_logits_topk", code);
+    const uint32_t qk_stride = desc.is_fp4 ? desc.head_dim / 2u : desc.head_dim;
+    jit->launch(kernel, config.launch_options,
+                desc.num_q_tokens, desc.num_kv_tokens,
+                gm_ptr<uint8_t>{static_cast<uint64_t>(qk_stride), reinterpret_cast<uintptr_t>(q)},
+                gm_ptr<uint8_t>{static_cast<uint64_t>(qk_stride), reinterpret_cast<uintptr_t>(kv)},
+                sf_q, sf_kv,
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(weights_stride), reinterpret_cast<uintptr_t>(weights)},
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(logits_stride), reinterpret_cast<uintptr_t>(logits)},
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(output_values_stride), reinterpret_cast<uintptr_t>(output_values)},
+                gm_ptr<int32_t>{static_cast<uint64_t>(output_indices_stride), reinterpret_cast<uintptr_t>(output_indices)},
+                cu_seq_len_k_start, cu_seq_len_k_end,
+                logits_stride, output_values_stride, output_indices_stride, topk);
+}
+
+static void launch_mqa_logits_topk_v2(
+    const MQALogitsDesc& desc, const MQALogitsConfig& config,
+    const uint32_t& weights_stride, const uint32_t& logits_stride,
+    const uint32_t& output_values_stride, const uint32_t& output_indices_stride,
+    const uint32_t& topk,
+    void* q, void* kv,
+    void* sf_q, void* sf_kv,
+    void* weights, void* logits,
+    void* output_values, void* output_indices,
+    void* cu_seq_len_k_start, void* cu_seq_len_k_end,
+    bool abort_when_nan_found, bool sorted_index
+) {
+    const uint32_t topk_tier = topk <= 512 ? 512u : (topk <= 1024 ? 1024u : 4096u);
+    // V2 uses short symbol mqa_logits_topk_pipelined_impl (25 chars) to dodge bisheng
+    // 15.0.5 codegen bug on mqa_logits_topk_pipelined_impl (30 chars) that drops
+    // AIV finalize code. V2 keeps its own 方案B reduce-loop histogram logic.
+    const auto code = std::format(R"(
+#include <deep_gemm/QuantLightningIndexerV2.hpp>
+
+using namespace deep_gemm;
+static void __instantiate() {{
+    auto p = reinterpret_cast<void*>(&mqa_logits_topk_pipelined_impl<
+        {},
+        {}, {},
+        {}, {}, {},
+        {}, {}, {},
+        {},
+        {},
+        {},
+        {},
+        {}>);
+}}
+)",
+        desc.is_fp4 ? "true" : "false",
+        desc.num_heads, desc.head_dim,
+        config.split_kv, config.mad_m, config.num_cd_stages,
+        config.num_q_stages, config.num_kv_stages, config.num_accum_stages,
+        config.num_logits_stages,
+        config.launch_options.num_blocks.value(),
+        topk_tier,
+        abort_when_nan_found ? "true" : "false",
+        sorted_index ? "true" : "false");
+    if (runtime->get_dry_run()) {
+        jit->compile_without_load("mqa_logits_topk_v2", code);
+        return;
+    }
+    const auto kernel = jit->compile("mqa_logits_topk_v2", code);
+    const uint32_t qk_stride = desc.is_fp4 ? desc.head_dim / 2u : desc.head_dim;
+    jit->launch(kernel, config.launch_options,
+                desc.num_q_tokens, desc.num_kv_tokens,
+                gm_ptr<uint8_t>{static_cast<uint64_t>(qk_stride), reinterpret_cast<uintptr_t>(q)},
+                gm_ptr<uint8_t>{static_cast<uint64_t>(qk_stride), reinterpret_cast<uintptr_t>(kv)},
+                sf_q, sf_kv,
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(weights_stride), reinterpret_cast<uintptr_t>(weights)},
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(logits_stride), reinterpret_cast<uintptr_t>(logits)},
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(output_values_stride), reinterpret_cast<uintptr_t>(output_values)},
+                gm_ptr<int32_t>{static_cast<uint64_t>(output_indices_stride), reinterpret_cast<uintptr_t>(output_indices)},
+                cu_seq_len_k_start, cu_seq_len_k_end,
+                logits_stride, output_values_stride, output_indices_stride, topk);
+}
+
+// V3: per-Q-block topk pipelined behind the next block's MMAD (方案 A + 块间流水).
+// Stage 1 runs with a single accum stage so the topk workspace fits above it in UB.
+static void launch_mqa_logits_topk_v3(
+    const MQALogitsDesc& desc, const MQALogitsConfig& config,
+    const uint32_t& weights_stride, const uint32_t& logits_stride,
+    const uint32_t& output_values_stride, const uint32_t& output_indices_stride,
+    const uint32_t& topk,
+    void* q, void* kv,
+    void* sf_q, void* sf_kv,
+    void* weights, void* logits,
+    void* output_values, void* output_indices,
+    void* cu_seq_len_k_start, void* cu_seq_len_k_end,
+    bool abort_when_nan_found, bool sorted_index
+) {
+    const uint32_t topk_tier = topk <= 512 ? 512u : (topk <= 1024 ? 1024u : 4096u);
+    const auto code = std::format(R"(
+#include <deep_gemm/QuantLightningIndexerV3.hpp>
+
+using namespace deep_gemm;
+static void __instantiate() {{
+    auto p = reinterpret_cast<void*>(&mqa_logits_topk_v3_impl<
+        {},
+        {}, {},
+        {}, {}, {},
+        {}, {}, {},
+        {},
+        {},
+        {},
+        {},
+        {}>);
+}}
+)",
+        desc.is_fp4 ? "true" : "false",
+        desc.num_heads, desc.head_dim,
+        config.split_kv, config.mad_m, config.num_cd_stages,
+        config.num_q_stages, config.num_kv_stages, config.num_accum_stages,
+        config.num_logits_stages,
+        config.launch_options.num_blocks.value(),
+        topk_tier,
+        abort_when_nan_found ? "true" : "false",
+        sorted_index ? "true" : "false");
+    if (runtime->get_dry_run()) {
+        jit->compile_without_load("mqa_logits_topk_v3", code);
+        return;
+    }
+    const auto kernel = jit->compile("mqa_logits_topk_v3", code);
+    const uint32_t qk_stride = desc.is_fp4 ? desc.head_dim / 2u : desc.head_dim;
+    jit->launch(kernel, config.launch_options,
+                desc.num_q_tokens, desc.num_kv_tokens,
+                gm_ptr<uint8_t>{static_cast<uint64_t>(qk_stride), reinterpret_cast<uintptr_t>(q)},
+                gm_ptr<uint8_t>{static_cast<uint64_t>(qk_stride), reinterpret_cast<uintptr_t>(kv)},
+                sf_q, sf_kv,
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(weights_stride), reinterpret_cast<uintptr_t>(weights)},
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(logits_stride), reinterpret_cast<uintptr_t>(logits)},
+                gm_ptr<bfloat16_t>{static_cast<uint64_t>(output_values_stride), reinterpret_cast<uintptr_t>(output_values)},
+                gm_ptr<int32_t>{static_cast<uint64_t>(output_indices_stride), reinterpret_cast<uintptr_t>(output_indices)},
+                cu_seq_len_k_start, cu_seq_len_k_end,
+                logits_stride, output_values_stride, output_indices_stride, topk);
+}
+
 struct PagedMQALogitsDesc {
     bool is_fp4;
     uint32_t num_q_tokens;
@@ -193,3 +372,5 @@ static void __instantiate() {{
 }
 
 } // namespace deep_gemm
+
+// LAUNCH_V3
